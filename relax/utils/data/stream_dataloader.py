@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
+from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
 from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
@@ -234,6 +235,8 @@ def create_stream_dataloader(
         pipeline stage) and the second element is a list with the number of
         microbatches for each step in the rollout.
     """
+
+    data_fields = replay_data_manager.register_consumer().fields(data_fields)
 
     # Choose the appropriate fetch function based on fully_async mode
     # Use partial to bind the broadcast_pp parameter
@@ -1121,6 +1124,9 @@ def post_process_rollout_data(args, rollout_data):
 
     from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
 
+    replay_consumer = replay_data_manager.register_consumer(rollout_kinds(args))
+    replay_consumer.receive_references(rollout_data)
+
     cuda_dev = device_utils.make_current_torch_device()
     rollout_data["tokens"] = [torch.as_tensor(t, dtype=torch.long, device=cuda_dev) for t in rollout_data["tokens"]]
     rollout_data["loss_masks"] = [
@@ -1230,21 +1236,7 @@ def post_process_rollout_data(args, rollout_data):
 
         restore_opd_topk_rollout_fields(rollout_data, args, cuda_dev)
 
-    if "rollout_routed_experts" in rollout_data:
-        from tensordict.tensorclass import NonTensorData
-
-        rollout_data["rollout_routed_experts"] = [
-            torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.long, device=cuda_dev)
-            for r in rollout_data["rollout_routed_experts"]
-        ]
-
-    if getattr(args, "use_rollout_indexer_replay", False) and "rollout_indexer_topk" in rollout_data:
-        from tensordict.tensorclass import NonTensorData
-
-        rollout_data["rollout_indexer_topk"] = [
-            torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.int32, device=cuda_dev)
-            for r in rollout_data["rollout_indexer_topk"]
-        ]
+    replay_consumer.receive_tensors(rollout_data, device=cuda_dev)
 
 
 class StreamingTQIterator:
@@ -1314,7 +1306,7 @@ class StreamingTQIterator:
             raise ValueError(f"max_stream_stall_s must be positive, got {max_stream_stall_s}")
         self.args = args
         self.tq_client = tq_client
-        self.data_fields = data_fields
+        self.data_fields = replay_data_manager.register_consumer().fields(data_fields)
         self.rollout_id = rollout_id
         self.token_budget = token_budget
         self.loss_scale = loss_scale

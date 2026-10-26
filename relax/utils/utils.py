@@ -3,6 +3,7 @@
 import os
 import socket
 from argparse import Namespace
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -13,6 +14,7 @@ from tensordict import TensorDict
 
 from relax.algorithms import get_algorithm
 from relax.algorithms.rewards import REWARD_NORMALIZERS
+from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
@@ -176,28 +178,8 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
             # per sample. Restore [R, K] at the training ingestion boundary.
             train_data[field] = [getattr(sample, field).reshape(-1).tolist() for sample in samples]
 
-    if samples[0].rollout_routed_experts is not None:
-        train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
-
-    if getattr(args, "use_rollout_indexer_replay", False):
-        indexer_topk = [getattr(sample, "rollout_indexer_topk", None) for sample in samples]
-        if any(value is None for value in indexer_topk):
-            raise RuntimeError("Every training sample must contain rollout_indexer_topk when replay is enabled")
-        widths = set()
-        for sample, value in zip(samples, indexer_topk, strict=False):
-            if not isinstance(value, np.ndarray):
-                raise TypeError(f"rollout_indexer_topk must be a numpy array, got {type(value)}")
-            if value.ndim != 2 or value.shape[0] != len(sample.tokens) - 1:
-                raise RuntimeError(
-                    "rollout_indexer_topk must be a 2-D array with one row per input token except the last, "
-                    f"got replay={value.shape}, tokens={len(sample.tokens)}"
-                )
-            if value.dtype != np.int32:
-                raise RuntimeError(f"rollout_indexer_topk must use int32, got {value.dtype}")
-            widths.add(value.shape[1])
-        if len(widths) != 1:
-            raise RuntimeError(f"Inconsistent rollout_indexer_topk widths in one batch: {sorted(widths)}")
-        train_data["rollout_indexer_topk"] = indexer_topk
+    producer = replay_data_manager.register_producer(rollout_kinds(args))
+    train_data.update(producer.build_tq_fields(samples))
 
     if samples[0].train_metadata is not None:
         train_data["metadata"] = [sample.train_metadata for sample in samples]
@@ -322,25 +304,8 @@ def dict_to_tensordict(
                     f"got nesting depth {depth}"
                 )
             continue
-        if key == "rollout_routed_experts":
-            # Flatten 3D numpy (seq_i, num_layers, topk) -> 2D tensor (seq_i, num_layers*topk)
-            # so NestedTensor jagged layout can handle variable seq_len efficiently.
-            # This avoids NonTensorStack wrapping which forces slow pickle serialization
-            # during dist.broadcast_object_list (~377 MB pickle -> ~14s overhead).
-            tensors = [
-                torch.from_numpy(np.ascontiguousarray(arr.reshape(arr.shape[0], -1))).to(torch.int32) for arr in value
-            ]
-            result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
-            continue
-        if key == "rollout_indexer_topk":
-            # Normalize each replay payload to 2-D (seq_i, flattened replay width)
-            # so NestedTensor jagged layout can handle variable seq_len efficiently.
-            # This avoids NonTensorStack wrapping which forces slow pickle serialization
-            # during dist.broadcast_object_list (~377 MB pickle -> ~14s overhead).
-            tensors = [
-                torch.from_numpy(np.ascontiguousarray(arr.reshape(arr.shape[0], -1))).to(torch.int32) for arr in value
-            ]
-            result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+        if replay_data_manager.handles(key):
+            result[key] = replay_data_manager.pack(key, value)
             continue
         if key == "trajectory_refs":
             # Serialized Ray ObjectRefs are padded to a fixed width per batch.
@@ -467,6 +432,13 @@ def post_process_env(args, env):
     for name in KERNEL_CACHE_ENV_NAMES:
         if name not in env["env_vars"] and (value := os.environ.get(name)) is not None:
             env["env_vars"][name] = value
+
+    # Serve replicas are created before the engine/train worker envs. Carry
+    # the replay mode and store identity across this first process boundary.
+    from relax.distributed.replay_manager import reference_environment
+
+    for name, value in reference_environment().items():
+        env["env_vars"].setdefault(name, value)
 
     # Generic env-var passthrough for overlay packages. Comma-separated list
     # of env-var names the driver wants forwarded to every Ray actor. Each
@@ -605,10 +577,15 @@ async def transfer_batch_to_data_system(
 
         # Pass sampler metadata inline so it lands atomically with ready samples.
         custom_meta = build_rollout_custom_meta(rollout_batch)
-        await data_system_client.async_put(
-            data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
+        ownership = (
+            replay_data_manager.region(f"train_{rollout_id}").queue_ownership(batch_samples)
+            if replay_data_manager.uses_references
+            else nullcontext()
         )
-
+        with ownership:
+            await data_system_client.async_put(
+                data=rollout_batch, partition_id=f"train_{rollout_id}", custom_meta=custom_meta, is_last=is_last
+            )
         logger.info(f"Batch {batch_count} transferred successfully for rollout_id: {rollout_id}")
     except Exception as e:
         logger.error(f"Error transferring batch {batch_count}: {e}")

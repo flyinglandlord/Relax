@@ -20,6 +20,7 @@ try_import_telemetry_hook()
 
 from relax.core.controller import Controller  # noqa: E402
 from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa: E402
+from relax.distributed.replay_manager import replay_data_manager  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
 from relax.utils.tracking_utils import init_tracking  # noqa: E402
@@ -68,9 +69,12 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     timeout_sec = _SHUTDOWN_TIMEOUT_SEC if exit_code else _NORMAL_SHUTDOWN_TIMEOUT_SEC
     if _kernel_cache_heartbeat is not None:
         timeout_sec += int(os.environ.get("RELAX_KERNEL_CACHE_EXIT_TIMEOUT_SEC", "600"))
-    watchdog = threading.Timer(timeout_sec, os._exit, args=(effective_exit_code,))
+    # A reference run that times out before releasing ownership is not a success.
+    watchdog_exit_code = (effective_exit_code or 1) if replay_data_manager.uses_references else effective_exit_code
+    watchdog = threading.Timer(timeout_sec, os._exit, args=(watchdog_exit_code,))
     watchdog.daemon = True
     watchdog.start()
+    shutdown_failed = False
     try:
         sig_name = signal.Signals(sig).name if sig else "atexit"
         logger.info(f"Graceful shutdown triggered ({sig_name}) — cleaning up SGLang engines...")
@@ -89,6 +93,7 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
                 _ctrl.shutdown()
             except Exception as e:
                 logger.warning(f"Controller shutdown error during {sig_name}: {e}")
+                shutdown_failed = True
 
         if ray.is_initialized():
             try:
@@ -99,10 +104,28 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
                         timeout_sec=int(os.environ.get("RELAX_KERNEL_CACHE_EXIT_TIMEOUT_SEC", "600")),
                     )
                     logger.info(f"Kernel cache agents finalized: {results}")
+            except Exception as e:
+                logger.warning(f"Serve shutdown error during {sig_name}: {e}")
+                shutdown_failed = True
+        # Replay shares the standard exit path, including startup failures and
+        # signals. Its node owners need Ray until all ownership has been released.
+        try:
+            replay_data_manager.finish_run()
+        except Exception as e:
+            logger.error(f"Replay finalization incomplete during {sig_name}: {e}")
+            if exit_code in (None, 0):
+                exit_code = 1
+
+        if ray.is_initialized():
+            try:
                 ray.shutdown()
                 logger.info("Ray shutdown successfully")
             except Exception as e:
                 logger.warning(f"Ray shutdown error during {sig_name}: {e}")
+                shutdown_failed = True
+
+        if replay_data_manager.uses_references and shutdown_failed and exit_code in (None, 0):
+            exit_code = 1
 
         if exit_code is not None:
             _hard_exit(exit_code)
@@ -137,6 +160,8 @@ def main(args):
                 )
             except RuntimeError:
                 pass
+
+        replay_data_manager.start_run()
 
         if os.environ.get("RELAX_KERNEL_CACHE_DIR"):
             from relax.distributed.ray.kernel_cache import start_kernel_cache_heartbeat_from_env

@@ -81,6 +81,10 @@ class RayTrainGroup:
         }
         # Compiler cache paths are train-actor-only.  Putting them in the Job
         # runtime env would make Serve/TQ/SGLang processes pollute the cache.
+        from relax.distributed.replay_manager import reference_environment
+
+        env_vars.update(reference_environment())
+
         kernel_cache_local_dir = env_vars.get("RELAX_KERNEL_CACHE_LOCAL_DIR")
         if kernel_cache_local_dir:
             env_vars["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "inductor")

@@ -349,7 +349,15 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     if os.getppid() != parent_pid:
         return
 
-    if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
+    if Envs.RELAX_REPLAY_REFERENCES and server_args.disaggregation_mode in (None, "null"):
+        from relax.distributed.replay_manager.sglang import run_reference_detokenizer, run_reference_scheduler
+
+        launch_server(
+            server_args,
+            run_scheduler_process_func=run_reference_scheduler,
+            run_detokenizer_process_func=run_reference_detokenizer,
+        )
+    elif Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
     else:
         launch_server(server_args)
@@ -571,6 +579,21 @@ class SGLangEngine(RayActor):
             sglang_overrides=self.sglang_overrides,
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
+        if Envs.RELAX_REPLAY_REFERENCES:
+            from relax.distributed.replay_manager.sglang import validate_configuration
+
+            if not (getattr(self.args, "rollout_external", False) or init_external_kwargs) and server_args_dict.get(
+                "disaggregation_mode", "null"
+            ) in (None, "null"):
+                from relax.distributed.replay_manager import replay_data_manager
+
+                validate_configuration(self.args, server_args_dict)
+                # Register the node while still inside the Ray parent. The CUDA
+                # scheduler child publishes locally without starting a Ray client.
+                replay_data_manager.store().register_local_owner()
+            else:
+                logger.info("SGLang retains its native HTTP payload; Replay publishes references at rollout ingress")
+
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]

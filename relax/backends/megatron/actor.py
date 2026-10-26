@@ -30,6 +30,8 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.distributed.replay_manager import replay_data_manager, rollout_kinds
+from relax.distributed.replay_manager.megatron import RoutingReplay, reference_execution
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.engine.sft.predict.runner import run_sft_predict
@@ -91,7 +93,6 @@ from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
-from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
     _extract_audio_seqlens,
@@ -898,7 +899,23 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.non_persistent_ckpt_type = old_non_persistent_ckpt_type
             self._switch_model("actor")
 
-    def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
+    def fill_routing_replay(
+        self, data_iterator, num_microbatches, rollout_data, *, delivery_manager=None, region=None, cache=None
+    ):
+        if "rollout_replay_refs" in rollout_data:
+            from relax.distributed.replay_manager.megatron import fill_reference_replay
+
+            fill_reference_replay(
+                self,
+                data_iterator,
+                num_microbatches,
+                kind="moe",
+                delivery_manager=delivery_manager,
+                region=region,
+                cache=cache,
+            )
+            return
+
         if "rollout_routed_experts" not in rollout_data:
             raise ValueError(
                 "rollout_routed_experts is required in rollout_data when use_rollout_routing_replay is set."
@@ -1020,8 +1037,24 @@ class MegatronTrainRayActor(TrainRayActor):
         for iterator in data_iterator:
             iterator.reset()
 
-    def fill_indexer_replay(self, data_iterator, num_microbatches, rollout_data):
+    def fill_indexer_replay(
+        self, data_iterator, num_microbatches, rollout_data, *, delivery_manager=None, region=None, cache=None
+    ):
         """Pack SGLang's logical C4 IDs into Megatron's local CP/PP layout."""
+        if "rollout_replay_refs" in rollout_data:
+            from relax.distributed.replay_manager.megatron import fill_reference_replay
+
+            fill_reference_replay(
+                self,
+                data_iterator,
+                num_microbatches,
+                kind="indexer",
+                delivery_manager=delivery_manager,
+                region=region,
+                cache=cache,
+            )
+            return
+
         from relax.utils.training.indexer_replay import IndexerReplay
 
         if "rollout_indexer_topk" not in rollout_data:
@@ -1923,6 +1956,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self._per_step_rollout and self.args.offload_train:
             self.sleep()
 
+    @reference_execution
     def train_actor(
         self,
         rollout_id: int,
@@ -1935,7 +1969,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         use_indexer_replay = getattr(self.args, "use_rollout_indexer_replay", False)
         if use_indexer_replay:
-            from relax.utils.training.indexer_replay import IndexerReplay
+            from relax.distributed.replay_manager.megatron import IndexerReplay
 
         # PPO colocate: ``values`` and ``loss_masks`` reach us via TransferQueue
         # and land on CPU (critic ``.cpu()`` s ``values`` before PUT). Inline
@@ -1972,10 +2006,13 @@ class MegatronTrainRayActor(TrainRayActor):
         else:
             data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
 
-        if self.args.use_rollout_routing_replay:
-            self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
-        if use_indexer_replay:
-            self.fill_indexer_replay(data_iterator, num_microbatches, rollout_data)
+        replay_data_manager.register_consumer(rollout_kinds(self.args)).prepare(
+            self,
+            data_iterator,
+            num_microbatches,
+            rollout_data,
+            region=replay_data_manager.region(sft_partition_id(self.args, rollout_id)),
+        )
 
         with inverse_timer("train_wait"), timer("train"):
             # All RL algorithms need ref/teacher/actor inline forwards to produce old_log_probs.
@@ -1991,7 +2028,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if should_compute_old_log_probs:
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
-                        os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                        RoutingReplay.set_stage("fallthrough")
                     if use_indexer_replay:
                         IndexerReplay.set_stage("fallthrough")
                     try:
@@ -2009,7 +2046,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 # Forward teacher model to get teacher_log_probs for Megatron-based OPD
                 if "teacher" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
-                        os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                        RoutingReplay.set_stage("fallthrough")
                     if use_indexer_replay:
                         IndexerReplay.set_stage("fallthrough")
                     self._switch_model("teacher")
@@ -2026,9 +2063,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 if not standard_dpo and (not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics):
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
-                            os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+                            RoutingReplay.set_stage("replay_forward")
                         else:
-                            os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                            RoutingReplay.set_stage("record")
                     if use_indexer_replay:
                         IndexerReplay.set_stage("replay_forward")
                     rollout_data.update(
@@ -2067,7 +2104,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             # Train
             if self.args.use_routing_replay:
-                os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+                RoutingReplay.set_stage("replay_backward")
             if use_indexer_replay:
                 IndexerReplay.set_stage("replay_backward")
             with timer("actor_train"):
@@ -2182,7 +2219,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def compute_ref_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
-            os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+            RoutingReplay.set_stage("fallthrough")
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_ref_log_prob.")
         data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
@@ -2225,9 +2262,9 @@ class MegatronTrainRayActor(TrainRayActor):
     def compute_actor_log_prob(self, rollout_id: int) -> None:
         if self.args.use_routing_replay:
             if self.args.use_rollout_routing_replay:
-                os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+                RoutingReplay.set_stage("replay_forward")
             else:
-                os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                RoutingReplay.set_stage("record")
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_actor_log_prob.")
         data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
         if self.args.multimodal_keys is not None:
@@ -2295,13 +2332,13 @@ class MegatronTrainRayActor(TrainRayActor):
             data_iterator_logprobs, num_microbatches_logprobs = data_iterator, num_microbatches
 
         if self.args.use_rollout_routing_replay:
-            self.fill_routing_replay(data_iterator, num_microbatches, sub_batch)
+            replay_data_manager.register_consumer({"moe"}).prepare(self, data_iterator, num_microbatches, sub_batch)
 
         if self.args.compute_advantages_and_returns:
             # Ref forward
             if "ref" in self.weights_backuper.backup_tags:
                 if self.args.use_routing_replay:
-                    os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                    RoutingReplay.set_stage("fallthrough")
                 self._switch_model("ref")
                 sub_batch.update(
                     self.compute_log_prob(data_iterator_logprobs, num_microbatches_logprobs, store_prefix="ref_")
@@ -2310,7 +2347,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # Teacher forward for Megatron-based OPD
             if "teacher" in self.weights_backuper.backup_tags:
                 if self.args.use_routing_replay:
-                    os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                    RoutingReplay.set_stage("fallthrough")
                 self._switch_model("teacher")
                 sub_batch.update(
                     self.compute_log_prob(data_iterator_logprobs, num_microbatches_logprobs, store_prefix="teacher_")
@@ -2321,9 +2358,9 @@ class MegatronTrainRayActor(TrainRayActor):
             if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                 if self.args.use_routing_replay:
                     if self.args.use_rollout_routing_replay:
-                        os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+                        RoutingReplay.set_stage("replay_forward")
                     else:
-                        os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                        RoutingReplay.set_stage("record")
                 sub_batch.update(self.compute_log_prob(data_iterator, num_microbatches, store_prefix=""))
                 if self.args.use_rollout_routing_replay:
                     RoutingReplay.clear_all_forward()
@@ -2420,6 +2457,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if clear_routing_replay_forward:
                 RoutingReplay.clear_all_forward()
 
+    @reference_execution
     def train_hybrid(self, rollout_id) -> None:
         """Hybrid mode: actor internally handles ref/actor_fwd/advantages
         computation via _switch_model, then trains, while using the async data
@@ -2557,7 +2595,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # ── Phase 3: Train on the full merged batch ──
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
             if self.args.use_routing_replay:
-                os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+                RoutingReplay.set_stage("replay_backward")
             with timer("actor_train"):
                 train(
                     rollout_id,
@@ -2661,7 +2699,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def train_async(self, rollout_id) -> None:
         if self.args.use_routing_replay:
-            os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            RoutingReplay.set_stage("replay_backward")
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train step.")
         data_fields = [
@@ -3558,29 +3596,31 @@ class MegatronTrainRayActor(TrainRayActor):
         # returns byte-identical sample ids regardless of PP/TP world size.
         # replay tensors rely on the NestedTensor jagged broadcast path
         # that per-rank fetch bypasses.
-        per_rank_fetch = self.args.per_rank_fetch and "rollout_routed_experts" not in data_fields
-        if getattr(self.args, "use_rollout_indexer_replay", False):
-            per_rank_fetch = per_rank_fetch and "rollout_indexer_topk" not in data_fields
+        replay_consumer = replay_data_manager.register_consumer()
+        data_fields = replay_consumer.fields(data_fields)
+        per_rank_fetch = self.args.per_rank_fetch and replay_consumer.allows_per_rank_fetch(data_fields)
         prefetched_rollout_data = None
         prefetched_fetch_time_s = None
         if prefetched_fetch is not None:
             if not per_rank_fetch:
                 raise RuntimeError("SFT train-data prefetch requires an active per-rank fetch path.")
             prefetched_rollout_data, prefetched_fetch_time_s = prefetched_fetch
+        replay_region = replay_data_manager.region(partition_id)
         rollout_data, batch_meta = get_data_from_transfer_queue(
-            self.args,
-            self.data_system_client,
-            data_fields,
-            batch_size,
-            partition_id,
-            task_name,
-            sampling_config,
-            batch_index,
+            args=self.args,
+            tq_client=self.data_system_client,
+            data_fields=data_fields,
+            batch_size=batch_size,
+            task_name=task_name,
+            sampling_config=sampling_config,
+            batch_index=batch_index,
+            partition_id=partition_id,
             broadcast_pp=broadcast_pp,
             per_rank_fetch=per_rank_fetch,
             prefetched_rollout_data=prefetched_rollout_data,
             prefetched_fetch_time_s=prefetched_fetch_time_s,
         )
+        replay_consumer.accept_batch(rollout_data, data_fields=data_fields, region=replay_region)
         if self._sft_image_preprocess_on_rank:
             # Swap image-ref descriptors for the CPU pixel tensors rebuilt by
             # the prefetch worker (or synchronously on paused/eval steps),

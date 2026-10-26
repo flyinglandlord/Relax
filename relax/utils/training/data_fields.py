@@ -2,6 +2,7 @@
 
 from argparse import Namespace
 
+from relax.distributed.replay_manager import replay_fields
 from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils.data.image_refs import sft_multimodal_data_fields
 
@@ -33,7 +34,7 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         fields.append("rollout_routed_experts")
     if getattr(args, "multimodal_keys", None) is not None:
         fields.append("multimodal_train_inputs")
-    return fields
+    return replay_fields(fields)
 
 
 def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
@@ -49,7 +50,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         if getattr(args, "task_type", "causal_lm") == "seq_cls":
             fields.append("classification_labels")
         fields.extend(sft_multimodal_data_fields(args))
-        return fields
+        return replay_fields(fields)
 
     from relax.algorithms import algorithm_needs_critic
 
@@ -71,7 +72,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
             from relax.utils.opd.opd_utils import consume_opd_train_data
 
             consume_opd_train_data(fields, args)
-        return fields
+        return replay_fields(fields)
 
     fields = _base_rollout_fields(args)
     if getattr(args, "advantage_estimator", None) == "score_centering":
@@ -99,4 +100,4 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         from relax.utils.opd.opd_utils import consume_opd_train_data
 
         consume_opd_train_data(fields, args)
-    return fields
+    return replay_fields(fields)

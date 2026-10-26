@@ -1360,6 +1360,7 @@ def log_rollout_data(
                 "sample_indices",
                 "sample_index_mask_sums",
                 "rollout_routed_experts",
+                "rollout_replay_refs",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",
                 "max_seq_lens",
